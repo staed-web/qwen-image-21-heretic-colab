@@ -17,11 +17,13 @@ One-click **Google Colab** notebook and a standalone **Gradio** app that runs [Q
 
    That is your **temporary** Gradio share link (~72 hours). It is **not** a permanent hosted demo.
 
-### Badge (fill in after publish)
+### Open-in-Colab
 
-```markdown
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/<USER>/<REPO>/blob/main/Qwen_Image_2_1_Heretic_Gradio.ipynb)
-```
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/staed-web/qwen-image-21-heretic-colab/blob/main/Qwen_Image_2_1_Heretic_Gradio.ipynb)
+
+Direct URL:
+
+https://colab.research.google.com/github/staed-web/qwen-image-21-heretic-colab/blob/main/Qwen_Image_2_1_Heretic_Gradio.ipynb
 
 ## Files
 
