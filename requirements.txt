@@ -1,7 +1,8 @@
 torch>=2.4.0
 transformers>=5.17
-git+https://github.com/huggingface/diffusers
 accelerate
 pillow
 gradio
 spaces
+torchao>=0.15.0
+git+https://github.com/huggingface/diffusers
