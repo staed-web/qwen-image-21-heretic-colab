@@ -1,33 +1,25 @@
 """
-Qwen-Image-2.1 + Heretic text encoder — Gradio app for Hugging Face Spaces (ZeroGPU-friendly).
-
-Uses transformers bf16 Heretic TE shards (NOT the ComfyUI-only GGUF).
+Gradio app: Qwen-Image-2.1 + Heretic text encoder.
+For Hugging Face Spaces (ZeroGPU) or local GPU.
 """
-
-from __future__ import annotations
-
+import gc
 import os
 import random
-from functools import lru_cache
+import types
 
 import gradio as gr
 import torch
 from PIL import Image
 
-# ZeroGPU on HF Spaces (optional)
 try:
-    import spaces  # type: ignore
-except ImportError:  # local / Colab / non-Spaces
+    import spaces
+except ImportError:
     spaces = None
 
-BASE_MODEL = os.environ.get("QWEN_IMAGE_BASE", "Qwen/Qwen-Image-2.1")
-HERETIC_TE = os.environ.get(
-    "QWEN_IMAGE_HERETIC_TE",
-    "pottokao/Qwen-Image-2.1-Text-Encoder-Heretic",
-)
+BASE_MODEL = "Qwen/Qwen-Image-2.1"
+HERETIC_TE = "pottokao/Qwen-Image-2.1-Text-Encoder-Heretic"
 DTYPE = torch.bfloat16
 
-# Colab / free-tier friendly (official defaults are 2048 — too heavy for T4 / ZeroGPU)
 ASPECT_RATIOS = {
     "1:1 (1024x1024)": (1024, 1024),
     "1:1 (768x768)": (768, 768),
@@ -43,52 +35,69 @@ TRANSPARENCY_PREFIX = "This is an RGBA image with transparency. "
 TRANSPARENCY_SUFFIX = " The image has alpha channel and the background is transparent."
 MAX_SEED = 2**31 - 1
 
-_pipe = None
+pipe = None
 
 
-def _import_qwen3_vl():
-    try:
-        from transformers import Qwen3VLForConditionalGeneration
+def patch_rope_device_sync(model):
+    """Fix inv_freq (CPU) vs position_ids (CUDA) under accelerate CPU offload."""
+    patched = 0
+    for module in model.modules():
+        if not hasattr(module, "inv_freq"):
+            continue
+        if getattr(module, "_heretic_rope_patch", False):
+            continue
+        orig_forward = module.forward
 
-        return Qwen3VLForConditionalGeneration
-    except ImportError:
-        try:
-            from transformers.models.qwen3_vl import Qwen3VLForConditionalGeneration
+        def make_forward(orig):
+            def forward(self, *args, **kwargs):
+                position_ids = kwargs.get("position_ids", None)
+                if position_ids is None and len(args) >= 2:
+                    position_ids = args[1]
+                x = args[0] if args else kwargs.get("x", None)
+                device = None
+                if position_ids is not None and hasattr(position_ids, "device"):
+                    device = position_ids.device
+                elif x is not None and hasattr(x, "device"):
+                    device = x.device
+                if device is not None and self.inv_freq.device != device:
+                    self.inv_freq.data = self.inv_freq.data.to(device=device, dtype=self.inv_freq.dtype)
+                return orig(*args, **kwargs)
 
-            return Qwen3VLForConditionalGeneration
-        except ImportError:
-            from transformers import AutoModelForImageTextToText
+            return forward
 
-            return AutoModelForImageTextToText
+        module.forward = types.MethodType(make_forward(orig_forward), module)
+        module._heretic_rope_patch = True
+        patched += 1
+    print(f"Patched {patched} RoPE module(s) for offload device sync")
 
 
-def get_pipe():
-    """Lazy-load pipeline once (Spaces cold start / ZeroGPU)."""
-    global _pipe
-    if _pipe is not None:
-        return _pipe
+def load_pipeline():
+    global pipe
+    if pipe is not None:
+        return pipe
 
     from diffusers import QwenImage21Pipeline
 
-    cls = _import_qwen3_vl()
-    print(f"Loading Heretic TE: {HERETIC_TE}")
-    text_encoder = cls.from_pretrained(HERETIC_TE, torch_dtype=DTYPE)
+    try:
+        from transformers import Qwen3VLForConditionalGeneration
+    except ImportError:
+        try:
+            from transformers.models.qwen3_vl import Qwen3VLForConditionalGeneration
+        except ImportError:
+            from transformers import AutoModelForImageTextToText as Qwen3VLForConditionalGeneration
 
-    print(f"Loading pipeline: {BASE_MODEL}")
-    pipe = QwenImage21Pipeline.from_pretrained(
-        BASE_MODEL,
-        text_encoder=text_encoder,
-        torch_dtype=DTYPE,
+    text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+        HERETIC_TE, torch_dtype=DTYPE
     )
-    # CPU offload works on Colab T4 and many Spaces GPUs; ZeroGPU still benefits from bf16.
-    if os.environ.get("QWEN_IMAGE_NO_OFFLOAD", "").lower() not in ("1", "true", "yes"):
-        pipe.enable_model_cpu_offload()
-    else:
-        pipe.to("cuda")
+    patch_rope_device_sync(text_encoder)
+
+    pipe = QwenImage21Pipeline.from_pretrained(
+        BASE_MODEL, text_encoder=text_encoder, torch_dtype=DTYPE
+    )
+    patch_rope_device_sync(pipe.text_encoder)
+    pipe.enable_model_cpu_offload()
     pipe.set_progress_bar_config(disable=None)
-    _pipe = pipe
-    print("Pipeline ready.")
-    return _pipe
+    return pipe
 
 
 def apply_transparency_template(prompt: str, transparent: bool) -> str:
@@ -110,8 +119,9 @@ def _generate_impl(
     randomize_seed,
     transparent_rgba,
     negative_prompt,
-    progress=gr.Progress(track_tqdm=True),
 ):
+    load_pipeline()
+
     if not prompt or not str(prompt).strip():
         raise gr.Error("Please enter a prompt.")
 
@@ -120,10 +130,9 @@ def _generate_impl(
     seed = int(seed)
 
     final_prompt = apply_transparency_template(str(prompt), bool(transparent_rgba))
-    width, height = ASPECT_RATIOS.get(aspect_ratio, (1024, 1024))
-    pipe = get_pipe()
-
+    width, height = ASPECT_RATIOS.get(aspect_ratio, (768, 768))
     generator = torch.Generator(device="cpu").manual_seed(seed)
+
     kwargs = dict(
         prompt=final_prompt,
         negative_prompt=negative_prompt or " ",
@@ -132,86 +141,72 @@ def _generate_impl(
         num_inference_steps=int(steps),
         generator=generator,
     )
-
     if reference_image is not None:
         if not isinstance(reference_image, Image.Image):
             reference_image = Image.fromarray(reference_image)
         kwargs["image"] = reference_image
 
-    with torch.inference_mode():
-        out = pipe(**kwargs).images[0]
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    try:
+        with torch.inference_mode():
+            out = pipe(**kwargs).images[0]
+    except torch.OutOfMemoryError as e:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise gr.Error(
+            "GPU out of memory. Use 768x768 or smaller and fewer steps. " + str(e)
+        ) from e
 
     return out, seed, final_prompt
 
 
 if spaces is not None:
-    generate = spaces.GPU(duration=180)(_generate_impl)
+    generate = spaces.GPU(duration=150)(_generate_impl)
 else:
     generate = _generate_impl
 
 
-def build_demo() -> gr.Blocks:
-    with gr.Blocks(title="Qwen-Image-2.1 + Heretic TE") as demo:
-        gr.Markdown(
-            """
-            # Qwen-Image-2.1 + Heretic Text Encoder
-            Base: `Qwen/Qwen-Image-2.1` | TE: `pottokao/Qwen-Image-2.1-Text-Encoder-Heretic`
-            (transformers bf16 shards — **not** the ComfyUI-only GGUF)
+with gr.Blocks(title="Qwen-Image-2.1 + Heretic TE") as demo:
+    gr.Markdown(
+        """
+        # Qwen-Image-2.1 + Heretic Text Encoder
+        Base: `Qwen/Qwen-Image-2.1` | TE: `pottokao/Qwen-Image-2.1-Text-Encoder-Heretic`
+        """
+    )
+    with gr.Row():
+        with gr.Column(scale=1):
+            prompt = gr.Textbox(label="Prompt", lines=4)
+            reference_image = gr.Image(
+                label="Optional reference image (edit / I2I)", type="pil", image_mode="RGBA"
+            )
+            aspect_ratio = gr.Dropdown(
+                label="Aspect ratio",
+                choices=list(ASPECT_RATIOS.keys()),
+                value="1:1 (768x768)",
+            )
+            with gr.Row():
+                steps = gr.Slider(1, 50, value=25, step=1, label="Steps")
+                seed = gr.Number(value=42, precision=0, label="Seed")
+            randomize_seed = gr.Checkbox(label="Randomize seed", value=False)
+            transparent_rgba = gr.Checkbox(label="Transparent RGBA template", value=False)
+            negative_prompt = gr.Textbox(label="Negative prompt", value=" ", lines=1)
+            run_btn = gr.Button("Generate", variant="primary")
+        with gr.Column(scale=1):
+            output_image = gr.Image(label="Output", type="pil", format="png")
+            used_seed = gr.Number(label="Seed used", precision=0)
+            used_prompt = gr.Textbox(label="Final prompt sent to model", lines=3)
 
-            Official blog / demos: [qwen.ai blog](https://qwen.ai/blog?id=qwen-image-2.1) · [wuli.art](https://wuli.art/explore) (CN)
-            """
-        )
-        with gr.Row():
-            with gr.Column(scale=1):
-                prompt = gr.Textbox(
-                    label="Prompt",
-                    lines=4,
-                    placeholder='e.g. A neon shop sign that reads "QWEN IMAGE 2.1", rainy night',
-                )
-                reference_image = gr.Image(
-                    label="Optional reference image (edit / I2I)",
-                    type="pil",
-                    image_mode="RGBA",
-                )
-                aspect_ratio = gr.Dropdown(
-                    label="Aspect ratio (memory-friendly)",
-                    choices=list(ASPECT_RATIOS.keys()),
-                    value="1:1 (1024x1024)",
-                )
-                with gr.Row():
-                    steps = gr.Slider(1, 50, value=25, step=1, label="Steps")
-                    seed = gr.Number(value=42, precision=0, label="Seed")
-                randomize_seed = gr.Checkbox(label="Randomize seed", value=False)
-                transparent_rgba = gr.Checkbox(
-                    label="Transparent RGBA (prepend official transparency prompt template)",
-                    value=False,
-                )
-                negative_prompt = gr.Textbox(label="Negative prompt", value=" ", lines=1)
-                run_btn = gr.Button("Generate", variant="primary")
-            with gr.Column(scale=1):
-                output_image = gr.Image(label="Output", type="pil", format="png")
-                used_seed = gr.Number(label="Seed used", precision=0)
-                used_prompt = gr.Textbox(label="Final prompt sent to model", lines=3)
-
-        inputs = [
-            prompt,
-            reference_image,
-            aspect_ratio,
-            steps,
-            seed,
-            randomize_seed,
-            transparent_rgba,
-            negative_prompt,
-        ]
-        outputs = [output_image, used_seed, used_prompt]
-        run_btn.click(fn=generate, inputs=inputs, outputs=outputs)
-        prompt.submit(fn=generate, inputs=inputs, outputs=outputs)
-    return demo
-
-
-demo = build_demo()
+    inputs = [
+        prompt, reference_image, aspect_ratio, steps, seed,
+        randomize_seed, transparent_rgba, negative_prompt,
+    ]
+    outputs = [output_image, used_seed, used_prompt]
+    run_btn.click(fn=generate, inputs=inputs, outputs=outputs)
+    prompt.submit(fn=generate, inputs=inputs, outputs=outputs)
 
 if __name__ == "__main__":
-    # Spaces sets GRADIO_SERVER_NAME; share=True is mainly for local/Colab ad-hoc runs
-    share = os.environ.get("GRADIO_SHARE", "").lower() in ("1", "true", "yes")
-    demo.queue(max_size=4).launch(share=share)
+    demo.queue(max_size=4).launch(share=os.getenv("GRADIO_SHARE", "0") == "1")
